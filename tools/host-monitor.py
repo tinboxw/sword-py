@@ -165,7 +165,7 @@ def update_wsl_hosts(new_ip):
                 write_one_line = f'wsl -d {wsl_name}'
 
             # 将更新后的内容写入 WSL 的 hosts 文件
-            echo_cmd = f'bash -c "echo -e \\"{chr(10).join(new_wsl_hosts_lines)}\\" > /tmp/hosts"'
+            echo_cmd = f'bash -c "echo -e \\"{chr(10).join(new_wsl_hosts_lines)}\\" > /etc/hosts"'
             # 替换换行符，这里将换行符替换为 \n 字符串
             echo_cmd = echo_cmd.replace('\n', '\\n')
             write_command = f'wsl -u root -d {wsl_name} {echo_cmd}'
