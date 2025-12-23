@@ -49,23 +49,61 @@ root = None
 single_instance_var = None
 monitor_status_var = None
 monitor_status_label = None
-status_sync_job = None
+monitor_thread = None
+monitor_state = 'idle'
+monitor_health_job = None
+auto_start_var = None
+log_level_var = None
+ip_strategy_var = None
+adapter_var = None
+adapter_combo = None
+interval_var = None
 WINDOW_ICON_IMAGE = None
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+APP_DIR = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else BASE_DIR
 
 
 def resource_path(relative_path: str) -> str:
     base_path = getattr(sys, '_MEIPASS', BASE_DIR)
     return os.path.join(base_path, relative_path)
 
+
+def resolve_icon_path() -> str | None:
+    return locate_icon_file('icon.ico')
+
+
+def locate_icon_file(filename: str) -> str | None:
+    if not filename:
+        return None
+
+    relative = os.path.join('icon', filename)
+    search_paths = [
+        os.path.join(APP_DIR, 'icon', filename),
+        resource_path(relative),
+        os.path.join(BASE_DIR, 'icon', filename),
+        os.path.join(APP_DIR, filename),
+        resource_path(filename),
+        os.path.join(BASE_DIR, filename)
+    ]
+
+    for candidate in search_paths:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return None
+
 # 保存 WSL 列表和域名列表的文件路径
-WSL_FILE = os.path.join(BASE_DIR, 'wsl_list.txt')
-DOMAIN_FILE = os.path.join(BASE_DIR, 'domain_list.txt')
-CONFIG_FILE = os.path.join(BASE_DIR, 'host_monitor_config.json')
+WSL_FILE = os.path.join(APP_DIR, 'wsl_list.txt')
+DOMAIN_FILE = os.path.join(APP_DIR, 'domain_list.txt')
+CONFIG_FILE = os.path.join(APP_DIR, 'host_monitor_config.json')
 
 DEFAULT_CONFIG = {
-    "enforce_single_instance": True
+    "enforce_single_instance": True,
+    "auto_start_monitor": False,
+    "log_level": 'INFO',
+    "ip_lookup_strategy": 'auto',
+    "preferred_adapter": '',
+    "scan_interval": 60
 }
 
 config = {}
@@ -73,6 +111,7 @@ single_instance_mutex = None
 
 LOG_CAPACITY = 500
 log_buffer = deque(maxlen=LOG_CAPACITY)
+WINDOWS_STARTUPINFO = None
 
 TRAY_MESSAGE_ID = win32con.WM_USER + 20
 TRAY_TOOLTIP = "IP 监控工具"
@@ -80,6 +119,8 @@ hwnd = None
 nid = None
 tray_icon_created = False
 tray_window_class_atom = None
+tray_icon_handles = {'idle': None, 'running': None, 'error': None}
+tray_icon_state = 'idle'
 
 THEME = {
     'bg': '#f4f6fb',
@@ -107,6 +148,14 @@ THEME = {
     'status_running_fg': '#1d4ed8',
     'status_idle_bg': '#fee2e2',
     'status_idle_fg': '#b91c1c'
+}
+
+LOG_LEVELS = ['DEBUG', 'INFO', 'WARNING', 'ERROR']
+LOG_LEVEL_INDEX = {level: idx for idx, level in enumerate(LOG_LEVELS)}
+
+IP_STRATEGIES = {
+    'auto': '自动探测 (UDP)',
+    'adapter': '指定网卡 (IPv4)'
 }
 
 DEFAULT_FONT = ('Microsoft YaHei UI', 10)
@@ -178,38 +227,65 @@ def load_config():
             print(f"读取配置文件失败，将使用默认配置: {exc}")
 
 
-def save_config():
+def sanitize_interval(value) -> int:
     try:
-        with open(CONFIG_FILE, 'w', encoding='utf-8') as file:
-            json.dump(config, file, ensure_ascii=False, indent=2)
-    except OSError as exc:
-        print(f"保存配置文件失败: {exc}")
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = DEFAULT_CONFIG['scan_interval']
+    return max(5, min(3600, parsed))
 
 
-def show_system_alert(message, title="IP 监控工具"):
+def sync_interval_from_config():
+    global interval
+    interval = sanitize_interval(config.get('scan_interval', DEFAULT_CONFIG['scan_interval']))
+    config['scan_interval'] = interval
+
+
+def monitor_worker():
+    global monitor_thread, running
     try:
-        ctypes.windll.user32.MessageBoxW(None, message, title, 0x10)
-    except Exception:
-        print(message)
+        check_ip_change()
+    except Exception as exc:
+        running = False
+        log_message(f"监控线程异常: {exc}", level='ERROR')
+        update_monitor_status_indicator('error', '线程异常')
+        if monitor_button and monitor_button.winfo_exists():
+            monitor_button.after(0, lambda: monitor_button.config(text="开启定时监测"))
+    finally:
+        monitor_thread = None
 
 
-def enforce_single_instance():
-    global single_instance_mutex
-    if not config.get("enforce_single_instance", True):
+def start_monitoring():
+    global running, monitor_thread
+    if running:
+        log_message("监测已经在运行中，无需重复启动。")
         return
-    mutex_name = "HostMonitorMutex"
+
+    running = True
     try:
-        single_instance_mutex = win32event.CreateMutex(None, False, mutex_name)
-        last_error = win32api.GetLastError()
-        if last_error == winerror.ERROR_ALREADY_EXISTS:
-            show_system_alert("检测到已有实例在运行，已阻止重复启动。")
-            raise SystemExit(0)
-    except pywintypes.error as exc:
-        print(f"创建单实例互斥量失败: {exc}")
+        monitor_thread = threading.Thread(target=monitor_worker, name='HostMonitorThread', daemon=True)
+        monitor_thread.start()
+        monitor_button.config(text="关闭定时监测")
+        update_monitor_status_indicator('running')
+        log_message("IP 监测已启动。")
+    except Exception as e:
+        log_message(f"启动监测线程时出错: {e}", level='ERROR')
+        running = False
+        monitor_thread = None
+        monitor_button.config(text="开启定时监测")
+        update_monitor_status_indicator('error', '启动失败')
+
+
+def stop_monitoring():
+    global running
+    running = False
+    monitor_button.config(text="开启定时监测")
+    update_monitor_status_indicator('idle')
+    log_message("IP 监测已停止。")
 
 
 def render_log_buffer():
-    if not (message_display and message_display.winfo_exists()):
+    if not message_display:
         return
 
     def refresh():
@@ -223,34 +299,233 @@ def render_log_buffer():
         except tk.TclError:
             pass
 
-    message_display.after(0, refresh)
+    try:
+        message_display.after(0, refresh)
+    except tk.TclError:
+        pass
 
 
-def log_message(message):
+def normalize_log_level(level: str) -> str:
+    level = (level or 'INFO').upper()
+    if level not in LOG_LEVEL_INDEX:
+        return 'INFO'
+    return level
+
+
+def should_log(level: str) -> bool:
+    configured = normalize_log_level(config.get('log_level', 'INFO'))
+    return LOG_LEVEL_INDEX[level] >= LOG_LEVEL_INDEX[configured]
+
+
+def log_message(message, level: str = 'INFO'):
+    level = normalize_log_level(level)
+    if not should_log(level):
+        return
+
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    text = f'[{timestamp}] {message}'
+    text = f'[{timestamp}] [{level}] {message}'
     print(text)
     log_buffer.appendleft(text)
     render_log_buffer()
 
 
-def update_monitor_status_indicator(is_running: bool):
-    if not monitor_status_var or not monitor_status_label:
+def save_config():
+    try:
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as file:
+            json.dump(config, file, ensure_ascii=False, indent=2)
+    except OSError as exc:
+        log_message(f'保存配置失败: {exc}', level='ERROR')
+
+
+def prepare_startupinfo():
+    global WINDOWS_STARTUPINFO
+    if WINDOWS_STARTUPINFO is None:
+        info = subprocess.STARTUPINFO()
+        info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        info.wShowWindow = win32con.SW_HIDE
+        WINDOWS_STARTUPINFO = info
+    return WINDOWS_STARTUPINFO
+
+
+def run_command(args, **kwargs):
+    if os.name == 'nt':
+        kwargs.setdefault('creationflags', subprocess.CREATE_NO_WINDOW)
+        kwargs.setdefault('startupinfo', prepare_startupinfo())
+    return subprocess.run(args, **kwargs)
+
+
+def enforce_single_instance():
+    global single_instance_mutex
+    if not config.get('enforce_single_instance', True):
         return
 
-    text = '监控运行中' if is_running else '已暂停'
-    style_name = 'StatusRunning.TLabel' if is_running else 'StatusIdle.TLabel'
-    monitor_status_var.set(text)
-    monitor_status_label.configure(style=style_name)
+    mutex_name = r"Global\IPMonitorHostMutex"
+    try:
+        single_instance_mutex = win32event.CreateMutex(None, False, mutex_name)
+        if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
+            warning = "IP 监控工具已在运行，如需重新打开请先退出当前实例。"
+            try:
+                ctypes.windll.user32.MessageBoxW(
+                    None,
+                    warning,
+                    "IP 监控工具",
+                    win32con.MB_OK | win32con.MB_ICONWARNING
+                )
+            except Exception:
+                print(warning)
+            sys.exit(0)
+    except pywintypes.error as exc:
+        log_message(f'创建单实例互斥量失败: {exc}', level='ERROR')
 
 
-def schedule_status_indicator_refresh():
-    global status_sync_job
-    if not root:
+def get_adapter_names():
+    adapters = []
+    for name, addrs in psutil.net_if_addrs().items():
+        if any(addr.family == socket.AF_INET and addr.address and not addr.address.startswith('127.') for addr in addrs):
+            adapters.append(name)
+    return sorted(set(adapters))
+
+
+def strategy_label_for_key(key: str) -> str:
+    return IP_STRATEGIES.get(key, IP_STRATEGIES['auto'])
+
+
+def strategy_key_from_label(label: str) -> str:
+    for key, text in IP_STRATEGIES.items():
+        if text == label:
+            return key
+    return 'auto'
+
+
+def on_auto_start_toggle():
+    config["auto_start_monitor"] = auto_start_var.get()
+    save_config()
+    log_message('自动启动设置已更新。')
+
+
+def on_log_level_change(event=None):
+    level = normalize_log_level(log_level_var.get())
+    config['log_level'] = level
+    save_config()
+    log_message(f'日志级别已更新为 {level}。')
+
+
+def update_adapter_combobox_state():
+    if not adapter_combo:
+        return
+    adapters = get_adapter_names()
+    preferred = config.get('preferred_adapter', '')
+    if preferred and preferred not in adapters:
+        adapter_var.set('')
+        preferred = ''
+        if config.get('preferred_adapter'):
+            config['preferred_adapter'] = ''
+            save_config()
+            log_message('首选网卡已清空（未找到指定网卡）。', level='WARNING')
+    adapter_combo['values'] = adapters
+    if config.get('ip_lookup_strategy', 'auto') == 'adapter':
+        adapter_combo.configure(state='readonly')
+    else:
+        adapter_combo.configure(state='disabled')
+
+
+def on_ip_strategy_change(event=None):
+    strategy_key = strategy_key_from_label(ip_strategy_var.get())
+    config['ip_lookup_strategy'] = strategy_key
+    save_config()
+    update_adapter_combobox_state()
+    log_message(f"IP 获取策略已切换为 {IP_STRATEGIES[strategy_key]}。")
+
+
+def on_adapter_selected(event=None):
+    adapter_name = adapter_var.get()
+    config['preferred_adapter'] = adapter_name
+    save_config()
+    log_message(f'首选网卡已更新为 {adapter_name or "(未指定)"}。')
+
+
+def on_interval_change(event=None):
+    global interval
+    if interval_var is None:
+        return
+    try:
+        new_value = int(interval_var.get())
+    except (tk.TclError, ValueError):
+        interval_var.set(interval)
+        return
+    new_value = max(5, new_value)
+    if new_value != interval:
+        interval = new_value
+        config['scan_interval'] = interval
+        save_config()
+        log_message(f'扫描间隔已更新为 {interval} 秒')
+    if interval_var.get() != interval:
+        interval_var.set(interval)
+
+
+def update_tray_icon_state(state: str, tooltip_detail: str | None = None):
+    global tray_icon_state
+    desired_state = 'running' if state == 'running' else 'error' if state == 'error' else 'idle'
+    tray_icon_state = desired_state
+
+    if not (tray_icon_created and nid):
         return
 
-    update_monitor_status_indicator(running)
-    status_sync_job = root.after(1000, schedule_status_indicator_refresh)
+    handle = tray_icon_handles.get(desired_state) or tray_icon_handles.get('idle') or tray_icon_handles.get('running')
+    if not handle:
+        return
+
+    tooltip_suffix = tooltip_detail or ''
+    tooltip_text = TRAY_TOOLTIP if not tooltip_suffix else f"{TRAY_TOOLTIP} · {tooltip_suffix}"
+    tooltip_text = tooltip_text[:127]
+
+    try:
+        win32gui.Shell_NotifyIcon(
+            win32gui.NIM_MODIFY,
+            (hwnd, 0, win32gui.NIF_ICON | win32gui.NIF_TIP, TRAY_MESSAGE_ID, handle, tooltip_text)
+        )
+    except pywintypes.error as exc:
+        log_message(f'托盘图标更新失败: {exc}', level='ERROR')
+
+
+def update_monitor_status_indicator(state: str, message: str | None = None):
+    def apply():
+        state_map = {
+            'running': ('监控运行中', 'StatusRunning.TLabel'),
+            'error': ('监控异常', 'StatusError.TLabel'),
+            'idle': ('已暂停', 'StatusIdle.TLabel')
+        }
+        label_text, style_name = state_map.get(state, state_map['idle'])
+        if message:
+            label_text = f"{label_text} · {message}"
+        monitor_status_var.set(label_text)
+        monitor_status_label.configure(style=style_name)
+        update_tray_icon_state(state, label_text)
+
+    if not (monitor_status_var and monitor_status_label):
+        return
+
+    if root and threading.current_thread() is not threading.main_thread():
+        root.after(0, lambda: apply())
+    else:
+        apply()
+
+
+def monitor_health_tick():
+    global monitor_health_job, running
+    if root is None:
+        return
+
+    if running and (monitor_thread is None or not monitor_thread.is_alive()):
+        running = False
+        update_monitor_status_indicator('error')
+        log_message('监控线程已停止运行，请检查日志。', level='ERROR')
+        try:
+            monitor_button.config(text="开启定时监测")
+        except Exception:
+            pass
+
+    monitor_health_job = root.after(2000, monitor_health_tick)
 
 
 def show_selection_dialog(title, options, multi=False, empty_message='暂无可选项'):
@@ -442,6 +717,11 @@ def configure_theme(style: ttk.Style, window: tk.Tk):
                     foreground=THEME['status_running_fg'],
                     padding=(12, 4),
                     font=DEFAULT_FONT)
+    style.configure('StatusError.TLabel',
+                    background='#fee2e2',
+                    foreground='#b91c1c',
+                    padding=(12, 4),
+                    font=DEFAULT_FONT)
 
     checkbox_images = ensure_checkbox_images(window)
     if 'FlatCheckbox.indicator' not in style.element_names():
@@ -521,7 +801,7 @@ def apply_system_titlebar(window: tk.Tk):
 
 def get_available_wsl_distros():
     try:
-        result = subprocess.run(['wsl', '-l', '-q'], capture_output=True, check=True)
+        result = run_command(['wsl', '-l', '-q'], capture_output=True, check=True)
         raw_bytes = result.stdout
         try:
             decoded = raw_bytes.decode('utf-16')
@@ -530,7 +810,7 @@ def get_available_wsl_distros():
         distros = [line.strip() for line in decoded.splitlines() if line.strip()]
         return distros
     except (subprocess.CalledProcessError, FileNotFoundError) as exc:
-        log_message(f"获取 WSL 列表失败: {exc}")
+        log_message(f"获取 WSL 列表失败: {exc}", level='ERROR')
         return []
 
 
@@ -566,21 +846,21 @@ def fetch_windows_hosts_entries():
             lines = file.readlines()
         return parse_hosts_lines(lines)
     except OSError as exc:
-        log_message(f'读取 Windows hosts 文件失败: {exc}')
+        log_message(f'读取 Windows hosts 文件失败: {exc}', level='ERROR')
         return []
 
 
 def fetch_wsl_hosts_entries(wsl_name):
     try:
-        result = subprocess.run([
+        result = run_command([
             'wsl', '-d', wsl_name, 'cat', '/etc/hosts'
         ], capture_output=True, text=True, check=True, encoding='utf-8')
         lines = result.stdout.splitlines()
         return parse_hosts_lines(lines)
     except subprocess.CalledProcessError as exc:
-        log_message(f"读取 {wsl_name} hosts 文件失败: {exc.stderr.strip() if exc.stderr else exc}")
+        log_message(f"读取 {wsl_name} hosts 文件失败: {exc.stderr.strip() if exc.stderr else exc}", level='ERROR')
     except Exception as exc:
-        log_message(f"访问 {wsl_name} hosts 文件出错: {exc}")
+        log_message(f"访问 {wsl_name} hosts 文件出错: {exc}", level='ERROR')
     return []
 
 
@@ -606,24 +886,39 @@ def gather_domain_candidates():
     return candidates
 
 
-def get_current_ip():
-    try:
-        # 尝试创建一个 UDP 套接字并连接到一个公网服务器
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        # 获取本地绑定的 IP 地址
-        local_ip = s.getsockname()[0]
-        s.close()
+def get_ip_from_adapter(adapter_name: str | None) -> str | None:
+    if not adapter_name:
+        return None
+    addrs = psutil.net_if_addrs().get(adapter_name)
+    if not addrs:
+        return None
+    for addr in addrs:
+        if addr.family == socket.AF_INET and addr.address and not addr.address.startswith('127.'):
+            return addr.address
+    return None
 
-        # 遍历所有网络接口，找到匹配的 IP 地址对应的接口
-        for interface, addrs in psutil.net_if_addrs().items():
-            for addr in addrs:
-                if addr.family == socket.AF_INET and addr.address == local_ip:
-                    return addr.address
+
+def detect_ip_via_udp() -> str | None:
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.connect(("8.8.8.8", 80))
+        local_ip = sock.getsockname()[0]
+        sock.close()
+        return local_ip
+    except Exception as exc:
+        log_message(f"自动探测 IP 时出错: {exc}", level='ERROR')
         return None
-    except Exception as e:
-        log_message(f"获取 IP 地址时出错: {e}")
-        return None
+
+
+def get_current_ip():
+    strategy = config.get('ip_lookup_strategy', 'auto')
+    if strategy == 'adapter':
+        adapter_name = config.get('preferred_adapter', '')
+        adapter_ip = get_ip_from_adapter(adapter_name)
+        if adapter_ip:
+            return adapter_ip
+        log_message('指定网卡无法获取 IPv4 地址，回退到自动探测。', level='WARNING')
+    return detect_ip_via_udp()
 
 def update_hosts_file(new_ip):
     if len(domains) > 0:
@@ -674,20 +969,20 @@ def update_windows_hosts(new_ip):
         log_message(f'Windows Hosts 文件已更新，新 IP 地址为: {new_ip}')
 
     except Exception as e:
-        log_message(f'更新 Windows Hosts 文件时出错: {e}')
+        log_message(f'更新 Windows Hosts 文件时出错: {e}', level='ERROR')
 
 def update_wsl_hosts(new_ip):
     for wsl_name in wsl_names:
         try:
-            result = subprocess.run([
+            result = run_command([
                 'wsl', '-d', wsl_name, 'cat', '/etc/hosts'
             ], capture_output=True, text=True, check=True, encoding='utf-8')
             wsl_hosts_lines = result.stdout.splitlines()
         except subprocess.CalledProcessError as exc:
-            log_message(f"读取 {wsl_name} 的 hosts 文件失败: {exc.stderr.strip() if exc.stderr else exc}")
+            log_message(f"读取 {wsl_name} 的 hosts 文件失败: {exc.stderr.strip() if exc.stderr else exc}", level='ERROR')
             continue
         except Exception as exc:
-            log_message(f"访问 WSL {wsl_name} 时出现未知错误: {exc}")
+            log_message(f"访问 WSL {wsl_name} 时出现未知错误: {exc}", level='ERROR')
             continue
 
         append_lines = []
@@ -718,14 +1013,14 @@ def update_wsl_hosts(new_ip):
 
         hosts_content = '\n'.join(wsl_hosts_lines) + '\n'
         try:
-            subprocess.run([
+            run_command([
                 'wsl', '-u', 'root', '-d', wsl_name, 'bash', '-c', 'cat > /etc/hosts'
             ], input=hosts_content, text=True, check=True, encoding='utf-8')
             log_message(f"已将更改同步到 {wsl_name} 的 hosts 文件")
         except subprocess.CalledProcessError as exc:
-            log_message(f"写入 {wsl_name} 的 hosts 文件失败: {exc.stderr.strip() if exc.stderr else exc}")
+            log_message(f"写入 {wsl_name} 的 hosts 文件失败: {exc.stderr.strip() if exc.stderr else exc}", level='ERROR')
         except Exception as exc:
-            log_message(f"同步到 {wsl_name} 时出现未知错误: {exc}")
+            log_message(f"同步到 {wsl_name} 时出现未知错误: {exc}", level='ERROR')
 def check_ip_change():
     current_ip = get_current_ip()
     if current_ip:
@@ -743,35 +1038,9 @@ def check_ip_change():
         if new_ip != current_ip:
             update_hosts_file(new_ip)
             current_ip = new_ip
-        else:
-            log_message('IP 未发生变更，忽略更新...')
-
-def start_monitoring():
-    global running
-    # 首先检查是否已经有监测在运行，如果是则不重复启动
-    global monitor_button
-    if running:
-        log_message("监测已经在运行中，无需重复启动。")
-        return
-
-    running = True
-    try:
-        monitor_thread = threading.Thread(target=check_ip_change)
-        monitor_thread.daemon = True
-        monitor_thread.start()
-        monitor_button.config(text="关闭定时监测")
-        log_message("IP 监测已启动。")
-    except Exception as e:
-        log_message(f"启动监测线程时出错: {e}")
-        running = False
-
-def stop_monitoring():
-    global running
-    running = False
-    monitor_button.config(text="开启定时监测")
-
+        #else:
+            # log_message('IP 未发生变更，忽略更新...')
 def toggle_monitoring():
-    global running
     if running:
         stop_monitoring()
     else:
@@ -782,25 +1051,18 @@ def refresh():
     if ip:
         update_hosts_file(ip)
     else:
-        log_message('无法手动刷新 IP：未获取到有效地址。')
+        log_message('无法手动刷新 IP：未获取到有效地址。', level='WARNING')
+
 
 def manual_refresh():
     try:
-        # 创建一个新的线程来执行 refresh 函数
         refresh_thread = threading.Thread(target=refresh)
-        update_monitor_status_indicator(True)
-        # 将线程设置为守护线程，这样当主线程退出时，该线程也会自动退出
         refresh_thread.daemon = True
-        # 启动线程
-        update_monitor_status_indicator(False)
         refresh_thread.start()
     except Exception as e:
-        # 若线程创建失败，打印错误信息并重置状态
-        log_message(f"启动刷新线程时出错: {e}")
+        log_message(f"启动刷新线程时出错: {e}", level='ERROR')
 
 def add_wsl():
-    update_monitor_status_indicator(False)
-    log_message("IP 监测已停止。")
     available = [d for d in get_available_wsl_distros() if d not in wsl_names]
     selections = show_selection_dialog(
         "选择 WSL 分发版",
@@ -818,7 +1080,6 @@ def add_wsl():
         wsl_names.append(name)
         wsl_listbox.insert(tk.END, name)
         log_message(f'已添加 WSL: {name}')
-
 
 def add_wsl_manual():
     wsl_name = simpledialog.askstring("手动添加 WSL", "请输入 WSL 名称:", parent=root)
@@ -910,13 +1171,6 @@ def import_domains_from_hosts():
         domain_listbox.insert(tk.END, domain)
         log_message(f"已导入域名 {domain} 来自 {entry['source']}")
 
-def set_interval():
-    global interval
-    new_interval = simpledialog.askinteger("设置扫描间隔", "请输入扫描间隔（秒）:", initialvalue=interval, parent=root)
-    if new_interval:
-        interval = new_interval
-        log_message(f'扫描间隔已更新为 {interval} 秒')
-
 def persist_lists():
     try:
         with open(WSL_FILE, 'w', encoding='utf-8') as f:
@@ -926,7 +1180,7 @@ def persist_lists():
             for domain in domains:
                 f.write(domain + '\n')
     except OSError as exc:
-        log_message(f'保存配置列表失败: {exc}')
+        log_message(f'保存配置列表失败: {exc}', level='ERROR')
 
 
 def show_window():
@@ -966,6 +1220,46 @@ def destroy_tray_icon():
             pass
 
 
+def load_icon_handle(hinst, path: str | None, flags: int) -> int | None:
+    if not path:
+        return None
+    try:
+        return win32gui.LoadImage(hinst, path, win32con.IMAGE_ICON, 0, 0, flags)
+    except Exception:
+        return None
+
+
+def resolve_icon_variant(filename: str) -> str | None:
+    return locate_icon_file(filename)
+
+
+def prepare_tray_icon_handles(hinst):
+    global tray_icon_handles
+    handles = {'idle': None, 'running': None, 'error': None}
+
+    icon_flags = win32con.LR_LOADFROMFILE | win32con.LR_DEFAULTSIZE
+    base_icon = resolve_icon_path()
+    running_icon = locate_icon_file('icon-running.ico')
+    handles['running'] = load_icon_handle(hinst, running_icon, icon_flags)
+    if not handles['running']:
+        handles['running'] = load_icon_handle(hinst, base_icon, icon_flags)
+
+    idle_icon = resolve_icon_variant('icon-idle.ico') or resolve_icon_variant('icon_inactive.ico')
+    handles['idle'] = load_icon_handle(hinst, idle_icon, icon_flags)
+
+    error_icon = resolve_icon_variant('icon-error.ico') or resolve_icon_variant('icon_alert.ico')
+    handles['error'] = load_icon_handle(hinst, error_icon, icon_flags)
+
+    if not handles['running']:
+        handles['running'] = win32gui.LoadIcon(0, win32con.IDI_INFORMATION)
+    if not handles['idle']:
+        handles['idle'] = win32gui.LoadIcon(0, win32con.IDI_APPLICATION)
+    if not handles['error']:
+        handles['error'] = win32gui.LoadIcon(0, win32con.IDI_WARNING)
+
+    tray_icon_handles = handles
+
+
 def exit_application():
     log_message('正在退出 IP 监控工具...')
     persist_lists()
@@ -976,10 +1270,10 @@ def exit_application():
             win32event.ReleaseMutex(single_instance_mutex)
         except Exception:
             pass
-    global status_sync_job
-    if root and status_sync_job:
+    global monitor_health_job
+    if root and monitor_health_job:
         try:
-            root.after_cancel(status_sync_job)
+            root.after_cancel(monitor_health_job)
         except Exception:
             pass
     if root:
@@ -993,12 +1287,10 @@ def create_tray_icon():
         return
 
     hinst = win32api.GetModuleHandle(None)
-    icon_path = resource_path('icon.ico')
-    try:
-        icon_flags = win32con.LR_LOADFROMFILE | win32con.LR_DEFAULTSIZE
-        hicon = win32gui.LoadImage(hinst, icon_path, win32con.IMAGE_ICON, 0, 0, icon_flags)
-    except Exception:
-        hicon = win32gui.LoadIcon(0, win32con.IDI_APPLICATION)
+    prepare_tray_icon_handles(hinst)
+    initial_icon = tray_icon_handles.get(tray_icon_state) or tray_icon_handles.get('idle') or tray_icon_handles.get('running')
+    if not initial_icon:
+        initial_icon = win32gui.LoadIcon(0, win32con.IDI_APPLICATION)
 
     def tray_wnd_proc(hWnd, msg, wParam, lParam):
         if msg == TRAY_MESSAGE_ID:
@@ -1032,21 +1324,24 @@ def create_tray_icon():
         if tray_window_class_atom is None:
             tray_window_class_atom = win32gui.RegisterClass(wc)
     except pywintypes.error as exc:
-        log_message(f"窗口类注册失败: {exc}")
+        log_message(f"窗口类注册失败: {exc}", level='ERROR')
         return
 
     try:
         hwnd = win32gui.CreateWindow(tray_window_class_atom, "IP 监控工具", 0, 0, 0, 0, 0, 0, 0, hinst, None)
     except pywintypes.error as exc:
-        log_message(f"窗口创建失败: {exc}")
+        log_message(f"窗口创建失败: {exc}", level='ERROR')
         return
 
-    nid = (hwnd, 0, win32gui.NIF_ICON | win32gui.NIF_MESSAGE | win32gui.NIF_TIP, TRAY_MESSAGE_ID, hicon, TRAY_TOOLTIP)
+    nid = (hwnd, 0, win32gui.NIF_ICON | win32gui.NIF_MESSAGE | win32gui.NIF_TIP, TRAY_MESSAGE_ID, initial_icon, TRAY_TOOLTIP)
     try:
         win32gui.Shell_NotifyIcon(win32gui.NIM_ADD, nid)
         tray_icon_created = True
     except pywintypes.error as exc:
-        log_message(f"系统托盘图标添加失败: {exc}")
+        log_message(f"系统托盘图标添加失败: {exc}", level='ERROR')
+        return
+
+    update_tray_icon_state(tray_icon_state, monitor_status_var.get() if monitor_status_var else None)
 
 # 读取 WSL 列表和域名列表文件
 def read_lists():
@@ -1060,6 +1355,7 @@ def read_lists():
 
 
 load_config()
+sync_interval_from_config()
 enforce_single_instance()
 read_lists()
 
@@ -1072,8 +1368,8 @@ root.rowconfigure(0, weight=1)
 
 def apply_window_icon(window: tk.Tk):
     global WINDOW_ICON_IMAGE
-    icon_file = resource_path('icon.ico')
-    if not os.path.exists(icon_file):
+    icon_file = resolve_icon_path()
+    if not icon_file:
         return
     try:
         window.iconbitmap(icon_file)
@@ -1092,37 +1388,39 @@ configure_theme(style, root)
 
 main_frame = ttk.Frame(root, style='Surface.TFrame')
 main_frame.grid(row=0, column=0, sticky="nsew", padx=24, pady=24)
-main_frame.columnconfigure(0, weight=1)
+for col in range(2):
+    main_frame.columnconfigure(col, weight=1)
 main_frame.rowconfigure(0, weight=0)
 main_frame.rowconfigure(1, weight=0)
 main_frame.rowconfigure(2, weight=1)
 main_frame.rowconfigure(3, weight=1)
-main_frame.rowconfigure(4, weight=1)
-
-# 顶部按钮
-button_frame = ttk.Frame(main_frame, style='Toolbar.TFrame', padding=10)
-button_frame.grid(row=0, column=0, sticky="ew", pady=(0, 14))
-
-toolbar_button_container = ttk.Frame(button_frame, style='Toolbar.TFrame')
-toolbar_button_container.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-monitor_button = ttk.Button(toolbar_button_container, text="开启定时监测", command=toggle_monitoring, style='Primary.TButton')
-monitor_button.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-
-refresh_button = ttk.Button(toolbar_button_container, text="手动刷新", command=manual_refresh, style='Secondary.TButton')
-refresh_button.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-
-set_interval_button = ttk.Button(toolbar_button_container, text="设置扫描间隔", command=set_interval, style='Secondary.TButton')
-set_interval_button.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
 
 monitor_status_var = tk.StringVar(value='已暂停')
-monitor_status_label = ttk.Label(button_frame, textvariable=monitor_status_var, style='StatusIdle.TLabel')
-monitor_status_label.pack(side=tk.RIGHT, padx=(12, 0))
-schedule_status_indicator_refresh()
+
+# 监控控制
+control_frame = ttk.LabelFrame(main_frame, text="监控控制", style='Card.TLabelframe')
+control_frame.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 18))
+control_frame.columnconfigure(0, weight=1)
+control_frame.columnconfigure(1, weight=1)
+
+monitor_status_var = tk.StringVar(value='已暂停')
+monitor_status_label = ttk.Label(control_frame, textvariable=monitor_status_var, style='StatusIdle.TLabel')
+monitor_status_label.grid(row=0, column=0, columnspan=2, sticky='w', padx=12, pady=(10, 6))
+
+button_row = ttk.Frame(control_frame, style='Card.TFrame')
+button_row.grid(row=1, column=0, columnspan=2, sticky='ew', padx=12, pady=(0, 12))
+button_row.columnconfigure(0, weight=1)
+button_row.columnconfigure(1, weight=1)
+
+monitor_button = ttk.Button(button_row, text="开启定时监测", command=toggle_monitoring, style='Primary.TButton')
+monitor_button.grid(row=0, column=0, padx=(0, 6), sticky='ew')
+
+refresh_button = ttk.Button(button_row, text="手动刷新", command=manual_refresh, style='Secondary.TButton')
+refresh_button.grid(row=0, column=1, padx=(6, 0), sticky='ew')
 
 # 常规设置
 settings_frame = ttk.LabelFrame(main_frame, text="常规设置", style='Card.TLabelframe')
-settings_frame.grid(row=1, column=0, sticky="ew", pady=(0, 18))
+settings_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 18))
 
 single_instance_var = tk.BooleanVar(value=config.get("enforce_single_instance", True))
 
@@ -1149,9 +1447,80 @@ close_hint_label = ttk.Label(
 )
 close_hint_label.pack(anchor='w', pady=(0, 6), padx=12)
 
+ttk.Separator(settings_frame, orient='horizontal').pack(fill=tk.X, padx=12, pady=(8, 8))
+
+advanced_frame = ttk.Frame(settings_frame, style='Card.TFrame')
+advanced_frame.pack(fill=tk.X, padx=12, pady=(0, 8))
+
+auto_start_var = tk.BooleanVar(value=config.get("auto_start_monitor", False))
+auto_start_check = ttk.Checkbutton(
+    advanced_frame,
+    text="启动后自动开始监测",
+    variable=auto_start_var,
+    command=on_auto_start_toggle,
+    style='Settings.TCheckbutton'
+)
+auto_start_check.pack(anchor='w', pady=(0, 6))
+
+interval_row = ttk.Frame(advanced_frame, style='Card.TFrame')
+interval_row.pack(fill=tk.X, pady=4)
+ttk.Label(interval_row, text="扫描间隔 (秒)", style='Muted.TLabel').pack(side=tk.LEFT)
+interval_var = tk.IntVar(value=interval)
+interval_spinbox = ttk.Spinbox(
+    interval_row,
+    from_=5,
+    to=3600,
+    increment=5,
+    width=10,
+    textvariable=interval_var,
+    justify='center',
+    command=on_interval_change
+)
+interval_spinbox.pack(side=tk.LEFT, padx=(12, 0))
+interval_spinbox.bind('<FocusOut>', on_interval_change)
+interval_spinbox.bind('<Return>', on_interval_change)
+
+log_level_row = ttk.Frame(advanced_frame, style='Card.TFrame')
+log_level_row.pack(fill=tk.X, pady=4)
+ttk.Label(log_level_row, text="日志级别", style='Muted.TLabel').pack(side=tk.LEFT)
+log_level_var = tk.StringVar(value=normalize_log_level(config.get('log_level', 'INFO')))
+log_level_combo = ttk.Combobox(log_level_row, textvariable=log_level_var, values=LOG_LEVELS, state='readonly', width=10)
+log_level_combo.pack(side=tk.LEFT, padx=(12, 0))
+log_level_combo.bind('<<ComboboxSelected>>', on_log_level_change)
+
+ip_strategy_row = ttk.Frame(advanced_frame, style='Card.TFrame')
+ip_strategy_row.pack(fill=tk.X, pady=4)
+ttk.Label(ip_strategy_row, text="IP 获取策略", style='Muted.TLabel').pack(side=tk.LEFT)
+ip_strategy_var = tk.StringVar(value=strategy_label_for_key(config.get('ip_lookup_strategy', 'auto')))
+ip_strategy_combo = ttk.Combobox(
+    ip_strategy_row,
+    textvariable=ip_strategy_var,
+    values=list(IP_STRATEGIES.values()),
+    state='readonly',
+    width=22
+)
+ip_strategy_combo.pack(side=tk.LEFT, padx=(12, 0))
+ip_strategy_combo.bind('<<ComboboxSelected>>', on_ip_strategy_change)
+
+adapter_row = ttk.Frame(advanced_frame, style='Card.TFrame')
+adapter_row.pack(fill=tk.X, pady=4)
+ttk.Label(adapter_row, text="首选网卡", style='Muted.TLabel').pack(side=tk.LEFT)
+adapter_var = tk.StringVar(value=config.get('preferred_adapter', ''))
+adapter_combo = ttk.Combobox(adapter_row, textvariable=adapter_var, width=28, state='disabled')
+adapter_combo.pack(side=tk.LEFT, padx=(12, 6))
+adapter_combo.bind('<<ComboboxSelected>>', on_adapter_selected)
+ttk.Button(adapter_row, text="刷新", command=update_adapter_combobox_state, style='Secondary.TButton').pack(side=tk.LEFT)
+update_adapter_combobox_state()
+
+lists_container = ttk.Frame(main_frame, style='Surface.TFrame')
+lists_container.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(0, 18))
+lists_container.columnconfigure(0, weight=1)
+lists_container.columnconfigure(1, weight=1)
+lists_container.rowconfigure(0, weight=1)
+
 # WSL 管理
-wsl_frame = ttk.LabelFrame(main_frame, text="WSL 列表", style='Card.TLabelframe')
-wsl_frame.grid(row=2, column=0, sticky="nsew", pady=(0, 18))
+wsl_frame = ttk.LabelFrame(lists_container, text="WSL 列表", style='Card.TLabelframe')
+wsl_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
 wsl_frame.columnconfigure(0, weight=1)
 wsl_frame.columnconfigure(1, weight=0)
 wsl_frame.rowconfigure(0, weight=1)
@@ -1181,8 +1550,8 @@ modify_wsl_button = ttk.Button(wsl_button_frame, text="修改", command=modify_w
 modify_wsl_button.pack(pady=4, fill=tk.X)
 
 # 域名管理
-domain_frame = ttk.LabelFrame(main_frame, text="域名列表", style='Card.TLabelframe')
-domain_frame.grid(row=3, column=0, sticky="nsew", pady=(0, 18))
+domain_frame = ttk.LabelFrame(lists_container, text="域名列表", style='Card.TLabelframe')
+domain_frame.grid(row=0, column=1, sticky="nsew", padx=(12, 0))
 domain_frame.columnconfigure(0, weight=1)
 domain_frame.columnconfigure(1, weight=0)
 domain_frame.rowconfigure(0, weight=1)
@@ -1213,7 +1582,7 @@ modify_domain_button.pack(pady=4, fill=tk.X)
 
 # 消息区域
 message_frame = ttk.LabelFrame(main_frame, text="运行日志", style='Card.TLabelframe')
-message_frame.grid(row=4, column=0, sticky="nsew")
+message_frame.grid(row=3, column=0, columnspan=2, sticky="nsew")
 message_frame.columnconfigure(0, weight=1)
 message_frame.rowconfigure(0, weight=1)
 
@@ -1224,6 +1593,12 @@ message_scrollbar.grid(row=0, column=1, sticky="ns", padx=(0, 12), pady=12)
 message_display.config(yscrollcommand=message_scrollbar.set)
 apply_text_theme(message_display)
 render_log_buffer()
+
+update_monitor_status_indicator('idle')
+monitor_health_tick()
+
+if config.get('auto_start_monitor'):
+    root.after(600, start_monitoring)
 
 log_message('应用已启动，等待操作。')
 
