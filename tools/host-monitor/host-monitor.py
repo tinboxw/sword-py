@@ -114,7 +114,7 @@ log_buffer = deque(maxlen=LOG_CAPACITY)
 WINDOWS_STARTUPINFO = None
 
 TRAY_MESSAGE_ID = win32con.WM_USER + 20
-TRAY_TOOLTIP = "IP 监控工具"
+TRAY_TOOLTIP = "IP HOST 同步器"
 hwnd = None
 nid = None
 tray_icon_created = False
@@ -363,12 +363,12 @@ def enforce_single_instance():
     try:
         single_instance_mutex = win32event.CreateMutex(None, False, mutex_name)
         if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
-            warning = "IP 监控工具已在运行，如需重新打开请先退出当前实例。"
+            warning = "IP HOST 同步器已在运行，如需重新打开请先退出当前实例。"
             try:
                 ctypes.windll.user32.MessageBoxW(
                     None,
                     warning,
-                    "IP 监控工具",
+                    "IP HOST 同步器",
                     win32con.MB_OK | win32con.MB_ICONWARNING
                 )
             except Exception:
@@ -1261,7 +1261,7 @@ def prepare_tray_icon_handles(hinst):
 
 
 def exit_application():
-    log_message('正在退出 IP 监控工具...')
+    log_message('正在退出 IP HOST 同步器...')
     persist_lists()
     save_config()
     destroy_tray_icon()
@@ -1328,7 +1328,7 @@ def create_tray_icon():
         return
 
     try:
-        hwnd = win32gui.CreateWindow(tray_window_class_atom, "IP 监控工具", 0, 0, 0, 0, 0, 0, 0, hinst, None)
+        hwnd = win32gui.CreateWindow(tray_window_class_atom, "IP HOST 同步器", 0, 0, 0, 0, 0, 0, 0, hinst, None)
     except pywintypes.error as exc:
         log_message(f"窗口创建失败: {exc}", level='ERROR')
         return
@@ -1361,7 +1361,7 @@ read_lists()
 
 # 创建主窗口
 root = tk.Tk()
-root.title("IP 监控工具")
+root.title("IP HOST 同步器")
 root.resizable(True, True)
 root.columnconfigure(0, weight=1)
 root.rowconfigure(0, weight=1)

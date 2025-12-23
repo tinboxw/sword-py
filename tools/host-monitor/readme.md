@@ -5,7 +5,7 @@ pyinstaller --onefile --windowed --clean --noupx --strip `
   --exclude-module=unittest `
   --icon=./icon/icon.ico `
   --add-data "icon;." `
-  -n IPHOST同步工具 `
+  -n IPHOST同步器 `
   ./host-monitor.py
 ```
 
